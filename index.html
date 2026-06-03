@@ -311,6 +311,14 @@ canvas {
     <button class="tb-btn" id="undoBtn">↩ Undo</button>
     <button class="tb-btn" id="clearBtn">✕ Clear</button>
     <button class="tb-btn" id="exportBtn">↓ PNG</button>
+  </div>
+  <div class="tb-sep"></div>
+  <div class="tb-group">
+    <button class="tb-btn" id="saveBtn">💾 Save</button>
+    <button class="tb-btn" id="loadBtn">📂 Open</button>
+  </div>
+  <div class="tb-sep"></div>
+  <div class="tb-group">
     <button class="tb-btn" id="helpBtn">? Keys</button>
   </div>
 </div>
@@ -395,11 +403,13 @@ canvas {
       <div class="sc-row"><span class="sc-key">F</span><span class="sc-desc">Draw Object</span></div>
       <div class="sc-row"><span class="sc-key">E</span><span class="sc-desc">Erase</span></div>
       <div class="sc-row"><span class="sc-key">Shift</span><span class="sc-desc">Hold for angle snap (0/45/90°)</span></div>
+      <div class="sc-row"><span class="sc-key">Ctrl+S</span><span class="sc-desc">Save project file</span></div>
+      <div class="sc-row"><span class="sc-key">Ctrl+O</span><span class="sc-desc">Open project file</span></div>
       <div class="sc-row"><span class="sc-key">Ctrl+Z</span><span class="sc-desc">Undo</span></div>
       <div class="sc-row"><span class="sc-key">Del / Bksp</span><span class="sc-desc">Delete selected</span></div>
       <div class="sc-row"><span class="sc-key">Esc</span><span class="sc-desc">Cancel / Deselect</span></div>
       <div class="sc-row"><span class="sc-key">Scroll</span><span class="sc-desc">Zoom in / out</span></div>
-      <div class="sc-row"><span class="sc-key">Right drag</span><span class="sc-desc">Pan canvas</span></div>
+      <div class="sc-row"><span class="sc-key">Space + drag</span><span class="sc-desc">Pan canvas</span></div>
       <div class="sc-row"><span class="sc-key">Dbl-click</span><span class="sc-desc">Finish wall chain</span></div>
       <button id="close-overlay">Close</button>
     </div>
@@ -1587,6 +1597,18 @@ document.addEventListener('keydown', e => {
     return;
   }
 
+  if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+    e.preventDefault();
+    saveProject();
+    return;
+  }
+
+  if ((e.ctrlKey || e.metaKey) && e.key === 'o') {
+    e.preventDefault();
+    loadProject();
+    return;
+  }
+
   // Tool shortcuts (ignore when typing in inputs)
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
   if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -1843,6 +1865,63 @@ document.getElementById('close-overlay').addEventListener('click', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 // Export PNG
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Save / Load project
+// ─────────────────────────────────────────────────────────────────────────────
+
+function saveProject() {
+  const data = JSON.stringify({ version: 1, walls, doors, windows, furniture, nextId }, null, 2);
+  const blob = new Blob([data], { type: 'application/json' });
+  const url  = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.download = 'floorplan.json';
+  link.href = url;
+  link.click();
+  URL.revokeObjectURL(url);
+  setStatus('Project saved as floorplan.json');
+}
+
+function loadProject() {
+  const input  = document.createElement('input');
+  input.type   = 'file';
+  input.accept = '.json';
+  input.onchange = e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const d = JSON.parse(ev.target.result);
+        if (!d.version) throw new Error('Not a valid floor planner file');
+        walls     = d.walls     || [];
+        doors     = d.doors     || [];
+        windows   = d.windows   || [];
+        furniture = d.furniture || [];
+        // Ensure nextId is higher than any existing id to avoid collisions
+        const allIds = [
+          ...walls.map(x => x.id), ...doors.map(x => x.id),
+          ...windows.map(x => x.id), ...furniture.map(x => x.id),
+        ];
+        nextId   = d.nextId ?? (allIds.length ? Math.max(...allIds) + 1 : 1);
+        selected = null;
+        isDrawing = false;
+        drawStart = null;
+        zoomTarget = camera.zoom; // prevent zoom animation fighting restored state
+        updateProps();
+        render();
+        setStatus(`Loaded: ${file.name}`);
+      } catch (err) {
+        alert('Could not load file: ' + err.message);
+      }
+    };
+    reader.readAsText(file);
+  };
+  input.click();
+}
+
+document.getElementById('saveBtn').addEventListener('click', saveProject);
+document.getElementById('loadBtn').addEventListener('click', loadProject);
 
 document.getElementById('exportBtn').addEventListener('click', () => {
   if (!walls.length && !doors.length && !windows.length && !furniture.length) {
