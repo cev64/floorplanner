@@ -455,8 +455,23 @@ let dragStartMouse = null; // screen {x, y}
 let dragStartData  = null; // snapshot of element position
 
 // Panning
-let isPanning = false;
-let panStart  = null;
+let isPanning      = false;
+let panStart       = null;
+let panLastPos     = null;
+let panLastTime    = 0;
+let panVel         = { x: 0, y: 0 };
+let panInertiaId   = null;
+let pendingPan     = false;   // left-click drag on empty space
+let pendingPanStart = null;
+
+// Space-key grab mode
+let spaceHeld = false;
+
+// Smooth zoom
+let zoomTarget  = 1;
+let zoomFocalW  = null;   // world coords of zoom focal point
+let zoomFocalS  = null;   // screen coords of zoom focal point
+let zoomAnimId  = null;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Units
@@ -1183,13 +1198,38 @@ function onMove(e) {
   const wp = s2w(sp.x, sp.y);
   mouseWorld = wp;
 
-  // Pan
+  // Active pan
   if (isPanning) {
-    camera.x += sp.x - panStart.x;
-    camera.y += sp.y - panStart.y;
-    panStart   = sp;
+    const now = performance.now();
+    const dt  = now - panLastTime;
+    if (panLastPos && dt > 0) {
+      const raw = 16 / Math.max(dt, 4); // normalise to ~60 fps frame
+      panVel.x = (sp.x - panLastPos.x) * raw;
+      panVel.y = (sp.y - panLastPos.y) * raw;
+    }
+    camera.x   += sp.x - panStart.x;
+    camera.y   += sp.y - panStart.y;
+    panStart    = sp;
+    panLastPos  = sp;
+    panLastTime = now;
     render();
     updateCoord(wp);
+    return;
+  }
+
+  // Pending pan (left-drag on empty canvas in select mode)
+  if (pendingPan) {
+    const dx = sp.x - pendingPanStart.x;
+    const dy = sp.y - pendingPanStart.y;
+    if (dx * dx + dy * dy > 25) {       // 5 px threshold before committing to pan
+      pendingPan  = false;
+      isPanning   = true;
+      panStart    = sp;
+      panLastPos  = sp;
+      panLastTime = performance.now();
+      panVel.x = panVel.y = 0;
+      canvas.style.cursor = 'grabbing';
+    }
     return;
   }
 
@@ -1245,15 +1285,30 @@ function onMove(e) {
   updateCoord(wp);
 }
 
+function startPan(sp) {
+  stopPanInertia();
+  isPanning   = true;
+  panStart    = sp;
+  panLastPos  = null;
+  panLastTime = performance.now();
+  panVel.x = panVel.y = 0;
+  canvas.style.cursor = 'grabbing';
+}
+
 function onDown(e) {
   const sp = screenPos(e);
   const wp = s2w(sp.x, sp.y);
 
-  // Right/middle click → pan
+  // Any button while Space held → pan
+  if (spaceHeld && e.button === 0) {
+    e.preventDefault();
+    startPan(sp);
+    return;
+  }
+
+  // Right / middle click → pan
   if (e.button === 1 || e.button === 2) {
-    isPanning = true;
-    panStart  = sp;
-    canvas.style.cursor = 'grabbing';
+    startPan(sp);
     return;
   }
   if (e.button !== 0) return;
@@ -1272,18 +1327,23 @@ function onDown(e) {
     if (hit) {
       selected = hit;
       const el = getEl(hit.type, hit.id);
-      isDragging    = true;
+      isDragging     = true;
       dragStartMouse = sp;
       if (hit.type === 'wall') {
         dragStartData = { x1: el.x1, y1: el.y1, x2: el.x2, y2: el.y2 };
       } else {
         dragStartData = { x: el.x, y: el.y };
       }
+      updateProps();
+      render();
     } else {
+      // Left-drag on empty space → deselect then begin pending pan
       selected = null;
+      updateProps();
+      render();
+      pendingPan      = true;
+      pendingPanStart = sp;
     }
-    updateProps();
-    render();
     return;
   }
 
@@ -1359,8 +1419,14 @@ function onDown(e) {
 }
 
 function onUp(e) {
+  if (pendingPan) {
+    pendingPan = false;   // was a click, not a drag — deselection already happened
+    updateCursor(mouseWorld);
+    return;
+  }
   if (isPanning) {
     isPanning = false;
+    startPanInertia();
     updateCursor(mouseWorld);
     return;
   }
@@ -1400,14 +1466,75 @@ function onDbl(e) {
 
 function onWheel(e) {
   e.preventDefault();
-  const sp     = screenPos(e);
-  const factor = e.deltaY < 0 ? 1.1 : 0.909;
-  const nz     = Math.max(0.15, Math.min(6, camera.zoom * factor));
-  camera.x     = sp.x - (sp.x - camera.x) * (nz / camera.zoom);
-  camera.y     = sp.y - (sp.y - camera.y) * (nz / camera.zoom);
-  camera.zoom  = nz;
-  document.getElementById('zoom-info').textContent = `${Math.round(nz * 100)}%`;
+  const sp = screenPos(e);
+  stopPanInertia();
+
+  // Mac pinch-to-zoom → Ctrl + wheel
+  if (e.ctrlKey) {
+    doZoom(sp, e.deltaY * 2.5);
+    return;
+  }
+
+  // Trackpad two-finger swipe: pixel-mode events with meaningful deltaX,
+  // or small deltaY values that come in rapid bursts
+  const pixelScroll = e.deltaMode === 0;
+  const hasHoriz    = pixelScroll && Math.abs(e.deltaX) > 1;
+  const smallVert   = pixelScroll && Math.abs(e.deltaY) < 40 && Math.abs(e.deltaX) > 0.5;
+
+  if (hasHoriz || smallVert) {
+    camera.x -= e.deltaX;
+    camera.y -= e.deltaY;
+    render();
+    return;
+  }
+
+  // Mouse wheel (or vertical-only trackpad scroll) → zoom
+  doZoom(sp, e.deltaY);
+}
+
+// ── Smooth zoom helpers ────────────────────────────────────────────────────────
+
+function doZoom(sp, deltaY) {
+  const factor  = deltaY < 0 ? 1.18 : 1 / 1.18;
+  zoomTarget    = Math.max(0.12, Math.min(8, zoomTarget * factor));
+  zoomFocalS    = { x: sp.x, y: sp.y };
+  zoomFocalW    = s2w(sp.x, sp.y);   // world pt under cursor — stays fixed
+  if (!zoomAnimId) zoomAnimId = requestAnimationFrame(stepZoom);
+}
+
+function stepZoom() {
+  const diff = zoomTarget - camera.zoom;
+  const done = Math.abs(diff) < 0.0015;
+  camera.zoom  = done ? zoomTarget : camera.zoom + diff * 0.22;
+  camera.x     = zoomFocalS.x - zoomFocalW.x * SCALE * camera.zoom;
+  camera.y     = zoomFocalS.y - zoomFocalW.y * SCALE * camera.zoom;
+  document.getElementById('zoom-info').textContent = `${Math.round(camera.zoom * 100)}%`;
   render();
+  zoomAnimId = done ? null : requestAnimationFrame(stepZoom);
+}
+
+// ── Pan inertia helpers ────────────────────────────────────────────────────────
+
+function stopPanInertia() {
+  if (panInertiaId) { cancelAnimationFrame(panInertiaId); panInertiaId = null; }
+  panVel.x = panVel.y = 0;
+}
+
+function startPanInertia() {
+  if (panInertiaId) cancelAnimationFrame(panInertiaId);
+  if (Math.hypot(panVel.x, panVel.y) < 0.5) { panVel.x = panVel.y = 0; return; }
+  function tick() {
+    camera.x   += panVel.x;
+    camera.y   += panVel.y;
+    panVel.x   *= 0.91;
+    panVel.y   *= 0.91;
+    render();
+    panInertiaId = Math.hypot(panVel.x, panVel.y) > 0.25
+      ? requestAnimationFrame(tick)
+      : null;
+    if (!panInertiaId) panVel.x = panVel.y = 0;
+  }
+  panInertiaId = requestAnimationFrame(tick);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1415,6 +1542,15 @@ function onWheel(e) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 document.addEventListener('keydown', e => {
+  if (e.key === ' ' && !e.target.matches('input, select, textarea')) {
+    e.preventDefault();
+    if (!spaceHeld) {
+      spaceHeld = true;
+      updateCursor(mouseWorld);
+    }
+    return;
+  }
+
   if (e.key === 'Shift') {
     shiftHeld = true;
     render();
@@ -1460,6 +1596,15 @@ document.addEventListener('keydown', e => {
 });
 
 document.addEventListener('keyup', e => {
+  if (e.key === ' ') {
+    spaceHeld = false;
+    if (isPanning) {
+      isPanning = false;
+      startPanInertia();
+    }
+    updateCursor(mouseWorld);
+    return;
+  }
   if (e.key === 'Shift') {
     shiftHeld = false;
     render();
@@ -1471,8 +1616,10 @@ document.addEventListener('keyup', e => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function updateCursor(wp) {
-  if (isPanning || isDragging) { canvas.style.cursor = 'grabbing'; return; }
+  if (isPanning) { canvas.style.cursor = 'grabbing'; return; }
   if (isRotating) { canvas.style.cursor = 'alias'; return; }
+  if (isDragging) { canvas.style.cursor = 'grabbing'; return; }
+  if (spaceHeld)  { canvas.style.cursor = 'grab'; return; }
 
   if (activeTool === 'select' && wp && selected && selected.type === 'furniture') {
     const el = getEl(selected.type, selected.id);
@@ -1745,6 +1892,7 @@ document.getElementById('exportBtn').addEventListener('click', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 resizeCanvas();
+zoomTarget = camera.zoom;
 setTool('select');
 </script>
 </body>
